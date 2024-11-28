@@ -4,7 +4,7 @@ import (
 	"context"
 )
 
-const LogCtxKey = "ke-lib-log"
+const LogCtxKey = "fordisk-log"
 
 type loggerContext struct {
 	context.Context

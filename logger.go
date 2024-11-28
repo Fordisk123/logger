@@ -3,12 +3,8 @@ package logger
 import (
 	"context"
 	"fmt"
-	rotatelogs "github.com/lestrrat/go-file-rotatelogs"
 	"io"
 	"os"
-	"runtime"
-	"strings"
-	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -26,131 +22,188 @@ const (
 	Prod = "PROD"
 )
 
-// AppName 是logger文件名前缀
-// LogDir 日志存储路径,默认是/var/log，使用默认请传空字符串
-// EncoderConfig 自定义的log输出配置，使用默认请传nil
-// MaxAge 日志保存时间，默认是30，使用默认请传0
-// RotationTime 日志分割时间，默认是1天，使用默认请传0
-type Config struct {
-	AppName       string                 `json:"appName" yaml:"appName"`
+const LoggerFormatJson = "json"
+const LoggerFormatClassic = "classic"
+
+type LogConfig struct {
+	Name          string                 `json:"appName" yaml:"appName"`
 	EncoderConfig *zapcore.EncoderConfig `json:"encoderConfig,omitempty" yaml:"encoderConfig,omitempty"`
 
-	//key携带详细信息
-	AddFuncInfoWithKey bool `json:"addFuncInfoWithKey,omitempty" yaml:"addFuncInfoWithKey,omitempty"`
+	//是否输出到文件
+	FileLog bool `json:"fileLog,omitempty" yaml:"fileLog,omitempty"`
 
 	//持久化参数
-	LogDir       string        `json:"logDir,omitempty" yaml:"basePath,omitempty"`
-	MaxAge       time.Duration `json:"maxAge,omitempty" yaml:"maxAge,omitempty"`
-	RotationTime time.Duration `json:"rotationTime,omitempty" yaml:"rotationTime,omitempty"`
+	//持久化文件夹不填默认./logs
+	LogDir string `json:"logDir,omitempty" yaml:"basePath,omitempty"`
+	//日志名称 不填默认是name
+	LogFileName string `json:"logFileName,omitempty" yaml:"fileName,omitempty"`
+	//最大保存时间，默认是7天，使用默认请传0
+	MaxAge int `json:"maxAge,omitempty" yaml:"maxAge,omitempty"`
+	// 单个文件最大大小，默认是100MB，使用默认请传0
+	MaxLogFileMB int `json:"maxLogFileMB,omitempty" yaml:"maxLogFileMB,omitempty"`
+	// 最大文件数量 默认10  使用默认请传0
+	MaxLogFileNum int `json:"maxLogFileNum,omitempty" yaml:"maxLogFileNum,omitempty"`
+	//是否压缩历史日志 默认不压缩
+	LogCompress bool `json:"logCompress,omitempty" yaml:"logCompress,omitempty"`
+
+	//是否跟随RUN_MODE环境变量决定输出类型 PROD为json 其他为classic
+	LoggerFormatFollowEnv bool `json:"loggerFormatFollowEnv" yaml:"loggerFormatFollowEnv"`
+	//输出格式  json or classic 上述配置文件是false的时候生效
+	LoggerFormatType string `json:"loggerFormatType" yaml:"loggerFormatType"`
+	//日志等级
+	Level zapcore.Level
+
+	//是否打印错误日志栈 默认不打印
+	LogErrorStack bool `json:"printErrorStack" yaml:"printErrorStack"`
+}
+
+func getDefaultEncoderConfig() *zapcore.EncoderConfig {
+	return &zapcore.EncoderConfig{
+		MessageKey:    "msg",
+		LevelKey:      "level",
+		TimeKey:       "time",
+		CallerKey:     "caller",
+		StacktraceKey: "trace",
+		LineEnding:    zapcore.DefaultLineEnding,
+		EncodeLevel:   zapcore.CapitalLevelEncoder, //log等级大写 DEBUG ,INFO 等。。
+		EncodeCaller:  zapcore.ShortCallerEncoder,  //简短调用栈
+		EncodeTime: func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
+			enc.AppendString(t.Format("2006-01-02 15:04:05"))
+		}, //使用可读时间输出
+		EncodeDuration: func(d time.Duration, enc zapcore.PrimitiveArrayEncoder) {
+			enc.AppendInt64(int64(d) / 1000000)
+		},
+	}
 }
 
 type Logger struct {
 	*zap.Logger
-	config *Config
+	writer io.Writer
 }
 
-var initDefaultLoggerOnce sync.Once
-var DefaultLogger *Logger
+func NewDefaultConfig(level zapcore.Level) *LogConfig {
+	return &LogConfig{
+		Name:                  "default",
+		EncoderConfig:         getDefaultEncoderConfig(),
+		FileLog:               false,
+		LogDir:                "",
+		LogFileName:           "",
+		MaxAge:                0,
+		MaxLogFileMB:          0,
+		MaxLogFileNum:         0,
+		LogCompress:           true,
+		LoggerFormatFollowEnv: false,
+		LoggerFormatType:      LoggerFormatClassic,
+		Level:                 level,
+		LogErrorStack:         true,
+	}
+}
 
-// 新建一个logger
-func NewLogger(config *Config, args ...interface{}) *Logger {
+func newLog(appName string, config *LogConfig, args ...interface{}) *Logger {
 	if config == nil {
-		config = &Config{}
+		panic("log config must not be nil")
 	}
 
-	if config.MaxAge == 0 {
-		config.MaxAge = time.Hour * 24 * 30
-	}
-
-	if config.RotationTime == 0 {
-		config.RotationTime = time.Hour * 24
-	}
-
-	if config.AppName == "" {
-		appNamePaths := strings.Split(os.Args[0], "/")
-		config.AppName = appNamePaths[len(appNamePaths)-1]
+	if config.Name == "" {
+		panic("log name must not be empty")
 	}
 
 	if config.EncoderConfig == nil {
-		config.EncoderConfig = &zapcore.EncoderConfig{
-			MessageKey:    "msg",
-			LevelKey:      "level",
-			TimeKey:       "time",
-			CallerKey:     "caller",
-			StacktraceKey: "trace",
-			LineEnding:    zapcore.DefaultLineEnding,
-			EncodeLevel:   zapcore.CapitalLevelEncoder, //log等级大写 DEBUG ,INFO 等。。
-			EncodeCaller:  zapcore.ShortCallerEncoder,  //简短调用栈
-			EncodeTime: func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
-				enc.AppendString(t.Format("2006-01-02 15:04:05"))
-			}, //使用可读时间输出
-			EncodeDuration: func(d time.Duration, enc zapcore.PrimitiveArrayEncoder) {
-				enc.AppendInt64(int64(d) / 1000000)
-			},
-		}
+		config.EncoderConfig = getDefaultEncoderConfig()
 	}
 
-	//全等级输出
-	allLevel := zap.LevelEnablerFunc(func(lvl zapcore.Level) bool {
-		return true
+	var writer io.Writer
+	if config.FileLog {
+		if config.MaxAge == 0 {
+			config.MaxAge = 7
+		}
+		if config.LogDir == "" {
+			config.LogDir = "./logs"
+		}
+		_, err := os.Stat(config.LogDir + "/" + config.LogDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				err := os.MkdirAll(config.LogDir, os.ModePerm)
+				if err != nil {
+					panic(fmt.Sprintf("mkdir failed![%s]\n", err.Error()))
+				}
+			}
+		}
+
+		if config.MaxLogFileMB == 0 {
+			config.MaxLogFileMB = 50
+		}
+		if config.MaxLogFileNum == 0 {
+			config.MaxLogFileNum = 10
+		}
+		if config.LogFileName == "" {
+			config.LogFileName = config.Name
+		}
+		writer = getWriter(config.LogDir, config.LogFileName, config.MaxAge, config.MaxLogFileMB, config.MaxLogFileNum, config.LogCompress)
+	} else {
+		writer = os.Stdout
+	}
+
+	if config.LoggerFormatFollowEnv {
+		switch os.Getenv(RunModeEnvName) {
+		case Prod:
+			config.LoggerFormatType = LoggerFormatJson
+		default:
+			config.LoggerFormatType = LoggerFormatClassic
+		}
+	}
+	if config.LoggerFormatType == "" {
+		config.LoggerFormatType = LoggerFormatClassic
+	}
+
+	levelFunc := zap.LevelEnablerFunc(func(lvl zapcore.Level) bool {
+		if config.Level > lvl {
+			return false
+		} else {
+			return true
+		}
 	})
 
 	var zapCore zapcore.Core
-	switch os.Getenv(RunModeEnvName) {
-	case Prod:
-		{
-			//生产环境中，向控制台输出Json日志
-			zapCore = zapcore.NewTee(
-				zapcore.NewCore(zapcore.NewJSONEncoder(*config.EncoderConfig), zapcore.AddSync(os.Stdout), allLevel),
-			)
-		}
-	default:
-		{
-			//开发环境中，向控制台输出经典日志
-			zapCore = zapcore.NewTee(
-				zapcore.NewCore(zapcore.NewConsoleEncoder(*config.EncoderConfig), zapcore.AddSync(os.Stdout), allLevel),
-			)
-		}
+	if config.LoggerFormatType == LoggerFormatJson {
+		zapCore = zapcore.NewCore(zapcore.NewJSONEncoder(*config.EncoderConfig), zapcore.AddSync(writer), levelFunc)
+	} else {
+		zapCore = zapcore.NewCore(zapcore.NewConsoleEncoder(*config.EncoderConfig), zapcore.AddSync(writer), levelFunc)
 	}
 
-	logger := zap.New(zapCore, zap.AddCaller(), zap.AddStacktrace(zap.ErrorLevel))
-	logger.Named(config.AppName)
+	var logger *zap.Logger
+	if config.LogErrorStack {
+		logger = zap.New(zapCore, zap.AddCaller(), zap.AddStacktrace(zap.ErrorLevel))
+	} else {
+		logger = zap.New(zapCore, zap.AddCaller(), zap.AddStacktrace(zap.FatalLevel))
+	}
+	logger.Named(appName)
 	logger = logger.With(handleFields(logger, args)...)
-	DefaultLogger = &Logger{logger, config}
-	return DefaultLogger
+
+	return &Logger{
+		Logger: logger,
+		writer: writer,
+	}
 }
 
 // 给logger添加键值对标记，传参必须是偶数个， 2个为一个键值对
 func WithFields(ctx context.Context, args ...interface{}) *Logger {
-	return withFields(ctx, 0, args...)
+	return withFields(ctx, args...)
 }
 
-func WithMap(ctx context.Context, kvMap map[string]interface{}) *Logger {
-	args := make([]interface{}, 0)
-	for k, v := range kvMap {
-		args = append(args, k)
-		args = append(args, v)
-	}
-	return withFields(ctx, 0, args...)
-}
-
-func withFields(ctx context.Context, skip int, args ...interface{}) *Logger {
+func withFields(ctx context.Context, args ...interface{}) *Logger {
 	if logCtx, ok := getLoggerCtx(ctx); ok {
-		return logCtx.Logger.withFields(logCtx, 1, args...)
+		ctx = logCtx
+		return logCtx.Logger.withFields(logCtx, args...)
 	} else {
 		if DefaultLogger == nil {
-			initDefaultLoggerOnce.Do(func() {
-				DefaultConfig := &Config{}
-				DefaultLogger = NewLogger(DefaultConfig)
-			})
+			panic("must init logger first")
 		}
-		if DefaultLogger.config.AddFuncInfoWithKey {
-			args = addFuncInfoWithKey(args, skip+1)
-		}
-		return &Logger{
+		log := &Logger{
 			Logger: DefaultLogger.With(handleFields(DefaultLogger.Logger, args)...),
-			config: DefaultLogger.config,
 		}
+		ctx = WithContext(ctx, log)
+		return log
 	}
 }
 
@@ -161,13 +214,17 @@ func WithContext(ctx context.Context, logger *Logger) context.Context {
 	}
 }
 
+func (log *Logger) GetWriter() io.Writer {
+	return log.writer
+}
+
 func (log *Logger) JustWithFields(ctx context.Context, args ...interface{}) *Logger {
 	return log.withFieldsPure(ctx, args...)
 }
 
 // 给logger添加键值对标记，传参必须是偶数个， 2个为一个键值对
 func (log *Logger) WithFields(ctx context.Context, args ...interface{}) *Logger {
-	return log.withFields(ctx, 0, args...)
+	return log.withFields(ctx, args...)
 }
 
 func (log *Logger) WithMap(ctx context.Context, kvMap map[string]interface{}) *Logger {
@@ -176,7 +233,7 @@ func (log *Logger) WithMap(ctx context.Context, kvMap map[string]interface{}) *L
 		args = append(args, k)
 		args = append(args, v)
 	}
-	return log.withFields(ctx, 0, args...)
+	return log.withFields(ctx, args...)
 }
 
 func (log *Logger) Infof(template string, args ...interface{}) {
@@ -207,17 +264,13 @@ func (log *Logger) logFields(ctx context.Context, args ...interface{}) *Logger {
 	return lc.Logger
 }
 
-func (log *Logger) withFields(ctx context.Context, skip int, args ...interface{}) *Logger {
-	if log.config.AddFuncInfoWithKey {
-		args = addFuncInfoWithKey(args, skip+1)
-	}
+func (log *Logger) withFields(ctx context.Context, args ...interface{}) *Logger {
 	return log.withFieldsPure(ctx, args...)
 }
 
 func (log *Logger) withFieldsPure(ctx context.Context, args ...interface{}) *Logger {
 	l := &Logger{
 		Logger: log.With(handleFields(log.Logger, args)...),
-		config: log.config,
 	}
 
 	lc, ok := getLoggerCtx(ctx)
@@ -226,18 +279,6 @@ func (log *Logger) withFieldsPure(ctx context.Context, args ...interface{}) *Log
 	}
 
 	return l
-}
-
-// GetLogger retrieves the current logger from the context. If no logger is
-// available, the default logger is returned.
-func GetLogger(ctx context.Context) *Logger {
-	lc := ctx.Value(LogCtxKey)
-	if lc != nil {
-		if logCtx, ok := lc.(*loggerContext); ok {
-			return logCtx.Logger
-		}
-	}
-	return DefaultLogger
 }
 
 func getLoggerCtx(ctx context.Context) (*loggerContext, bool) {
@@ -251,29 +292,6 @@ func getLoggerCtx(ctx context.Context) (*loggerContext, bool) {
 		}
 	}
 	return nil, false
-}
-
-func getFileWriter(config *Config) io.Writer {
-	_, err := os.Stat(config.LogDir + "/" + config.AppName)
-	if err != nil {
-		if os.IsNotExist(err) {
-			err := os.MkdirAll(config.LogDir+"/"+config.AppName, os.ModePerm)
-			if err != nil {
-				panic(fmt.Sprintf("mkdir failed![%s]\n", err.Error()))
-			}
-		}
-	}
-
-	hook, err := rotatelogs.New(
-		config.LogDir+"/"+config.AppName+"/"+"log.%Y-%m-%d",
-		rotatelogs.WithLinkName("log"),
-		rotatelogs.WithMaxAge(time.Hour*24*7),
-		rotatelogs.WithRotationTime(time.Hour*24),
-	)
-	if err != nil {
-		panic(fmt.Sprintf("init rotatelog fail:%s", err.Error()))
-	}
-	return hook
 }
 
 // handleFields converts a bunch of arbitrary key-value pairs into Zap fields.  It takes
@@ -319,35 +337,4 @@ func handleFields(l *zap.Logger, args []interface{}, additional ...zap.Field) []
 	}
 
 	return append(fields, additional...)
-}
-
-func addFuncInfoWithKey(args []interface{}, skip int) []interface{} {
-	res := make([]interface{}, 0, len(args))
-
-	if len(args)%2 == 1 {
-		panic("args must be even")
-	}
-
-	for i := 0; i < len(args); {
-		key, value := args[i], args[i+1]
-		keyStr, isString := key.(string)
-		if !isString {
-			// if the key isn't a string, DPanic and stop logging
-			panic("args key must be string")
-		}
-		res = append(res, getFuncAndLine(skip)+" -- "+keyStr, value)
-		i += 2
-	}
-
-	return res
-}
-
-// skip 记录内部调用层级，每有一次内部函数栈调用就需要+1，基础是3
-func getFuncAndLine(skip int) string {
-	pc, _, line, ok := runtime.Caller(3 + skip)
-	if ok {
-		return fmt.Sprintf("%s:%d", runtime.FuncForPC(pc).Name(), line)
-	} else {
-		return ""
-	}
 }
